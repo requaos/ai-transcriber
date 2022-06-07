@@ -1,15 +1,22 @@
 import os
 import datetime
 import argparse
-from huggingsound import SpeechRecognitionModel
 from asteroid.separate import file_separate
 from asteroid.models import ConvTasNet, BaseModel
 from asteroid.dsp.overlap_add import LambdaOverlapAdd
 from pydub import AudioSegment
+from typing import Iterator, Optional
 import soundfile as sf
 import torch
+import warnings
+import librosa
+import numpy as np
+from transformers import Wav2Vec2Processor, HubertForCTC
 
 torch.cuda.is_available()
+
+processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-xlarge-ls960-ft")
+hb_model = HubertForCTC.from_pretrained("facebook/hubert-xlarge-ls960-ft").to("cuda")
 
 # device = torch.device("cuda")
 
@@ -37,7 +44,7 @@ def mp3_to_clean_wav(input_mp3: str) -> str:
     sound.export(main_wav, format="wav")
     # This will output the clean wav file with _est1.wav
     out_file, _ = os.path.splitext(main_wav)
-    file_separate(continuous_nnet, main_wav, force_overwrite=True)
+    file_separate(continuous_nnet, main_wav, force_overwrite=True, resample=True)
     os.remove(main_wav)
     os.rename(f'{out_file}_est1.wav', main_wav)
     return main_wav
@@ -81,9 +88,6 @@ def load_wav(path: str) -> (torch.Tensor, int):
     return torch.from_numpy(mixture), fs
 
 
-model = SpeechRecognitionModel("jonatasgrosman/wav2vec2-large-xlsr-53-english", device="cuda")
-
-
 def walk_for_chapter(path: str) -> list[str]:
     paths = []
     for root, _, files in os.walk(path):
@@ -93,25 +97,113 @@ def walk_for_chapter(path: str) -> list[str]:
     return paths
 
 
-def transcribe(paths: list[str], sep: str = "\r\n") -> str:
+def get_waveforms(paths: list[str], sampling_rate: Optional[int] = 16000) -> list[np.ndarray]:
+    waveforms = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for path in paths:
+            waveform, sr = librosa.load(path, sr=sampling_rate)
+            waveforms.append(waveform)
+
+    return waveforms
+
+
+def hb_transcribe(paths: list[str], sep: str = "\r\n") -> str:
+    input_values = processor(get_waveforms(paths), padding=True, do_normalize=True, return_tensors="pt").input_values  # Batch size 1
+    logits = hb_model(input_values).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
     document = []
-    transcriptions = model.transcribe(paths)
-    for chunk in transcriptions:
-        document.append(chunk.get('transcription'))
-    return sep.join(document)
+    for id in predicted_ids:
+        document.append(str(processor.decode(id)))
+    return sep.join(document).lower()
 
 
-def process_mp3(input_mp3: str):
+
+# from huggingsound import SpeechRecognitionModel
+# w2v2_model = SpeechRecognitionModel("jonatasgrosman/wav2vec2-large-xlsr-53-english", device="cuda")
+
+
+# def w2v2_transcribe(paths: list[str], sep: str = "\r\n") -> str:
+#     document = []
+#     transcriptions = w2v2_model.transcribe(paths)
+#     for chunk in transcriptions:
+#         document.append(chunk.get('transcription'))
+#     return sep.join(document)
+
+
+# def process_mp3(input_mp3: str):
+#     t1 = datetime.datetime.now()
+#     outs = mp3_to_clean_wav(
+#         input_mp3)
+#     wav_parts = wav_to_wavs(outs, 38)
+#     # print(wav_parts)
+#     transcription = w2v2_transcribe(wav_parts, sep=' ')
+#
+#     target_path, _ = os.path.splitext(input_mp3)
+#     with open(f'{target_path}-transcription.txt', 'w') as f:
+#         f.write(transcription)
+#     print(f'{target_path} took {datetime.datetime.now() - t1} to process')
+
+
+def process_long_wav_from_mp3(input_mp3: str, sample_rate: int = 16000, device: str = "cuda"):
     t1 = datetime.datetime.now()
     outs = mp3_to_clean_wav(
         input_mp3)
-    wav_parts = wav_to_wavs(outs, 38)
-    # print(wav_parts)
-    transcription = transcribe(wav_parts, sep=' ')
+    audio, _ = librosa.load(outs, sr=sample_rate)
+    chunk_duration = 18  # sec
+    padding_duration = 2  # sec
+
+    chunk_len = chunk_duration * sample_rate
+    input_padding_len = int(padding_duration * sample_rate)
+    output_padding_len = hb_model._get_feat_extract_output_lengths(input_padding_len)
+
+    all_preds = []
+    for start in range(input_padding_len, len(audio) - input_padding_len, chunk_len):
+        chunk = audio[start - input_padding_len:start + chunk_len + input_padding_len]
+
+        input_values = processor(chunk, sampling_rate=sample_rate, return_tensors="pt").input_values
+        with torch.no_grad():
+            logits = hb_model(input_values.to(device)).logits[0]
+            logits = logits[output_padding_len:len(logits) - output_padding_len]
+
+            predicted_ids = torch.argmax(logits, dim=-1)
+            all_preds.append(predicted_ids.cuda())
+
+    transcription = processor.decode(torch.cat(all_preds))
 
     target_path, _ = os.path.splitext(input_mp3)
     with open(f'{target_path}-transcription.txt', 'w') as f:
-        f.write(transcription)
+        f.write(str(transcription).lower())
+    print(f'{target_path} took {datetime.datetime.now() - t1} to process')
+
+
+def process_long_wav(input_wav: str, sample_rate: int = 16000, device: str = "cuda"):
+    t1 = datetime.datetime.now()
+    audio, _ = librosa.load(input_wav, sr=sample_rate)
+    chunk_duration = 18  # sec
+    padding_duration = 2  # sec
+
+    chunk_len = chunk_duration * sample_rate
+    input_padding_len = int(padding_duration * sample_rate)
+    output_padding_len = hb_model._get_feat_extract_output_lengths(input_padding_len)
+
+    all_preds = []
+    for start in range(input_padding_len, len(audio) - input_padding_len, chunk_len):
+        chunk = audio[start - input_padding_len:start + chunk_len + input_padding_len]
+
+        input_values = processor(chunk, sampling_rate=sample_rate, return_tensors="pt").input_values
+        with torch.no_grad():
+            logits = hb_model(input_values.to(device)).logits[0]
+            logits = logits[output_padding_len:len(logits) - output_padding_len]
+
+            predicted_ids = torch.argmax(logits, dim=-1)
+            all_preds.append(predicted_ids.cpu())
+
+    transcription = processor.decode(torch.cat(all_preds))
+
+    target_path, _ = os.path.splitext(input_wav)
+    with open(f'{target_path}-transcription.txt', 'w') as f:
+        f.write(str(transcription).lower())
     print(f'{target_path} took {datetime.datetime.now() - t1} to process')
 
 
@@ -124,4 +216,5 @@ if __name__ == '__main__':
     for root, dirs, files in os.walk(args.input_dir):
         for file in files:
             if file.endswith(".mp3"):
-                process_mp3(os.path.join(root, file))
+                # process_mp3(os.path.join(root, file))
+                process_long_wav_from_mp3(os.path.join(root, file))
