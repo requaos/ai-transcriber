@@ -12,9 +12,11 @@ import warnings
 import librosa
 import numpy as np
 from transformers import Wav2Vec2Processor, HubertForCTC
+from deepmultilingualpunctuation import PunctuationModel
 
 torch.cuda.is_available()
 
+punctuation_model = PunctuationModel()
 processor = Wav2Vec2Processor.from_pretrained("facebook/hubert-xlarge-ls960-ft")
 hb_model = HubertForCTC.from_pretrained("facebook/hubert-xlarge-ls960-ft").to("cuda")
 
@@ -170,10 +172,11 @@ def process_long_wav_from_mp3(input_mp3: str, sample_rate: int = 16000, device: 
             all_preds.append(predicted_ids.cuda())
 
     transcription = processor.decode(torch.cat(all_preds))
+    transcription_with_punctuation = punctuation_model.restore_punctuation(transcription)
 
     target_path, _ = os.path.splitext(input_mp3)
     with open(f'{target_path}-transcription.txt', 'w') as f:
-        f.write(str(transcription).lower())
+        f.write(str(transcription_with_punctuation).lower())
     print(f'{target_path} took {datetime.datetime.now() - t1} to process')
 
 
