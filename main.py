@@ -171,8 +171,14 @@ def process_long_wav_from_mp3(input_mp3: str, sample_rate: int = 16000, device: 
             predicted_ids = torch.argmax(logits, dim=-1)
             all_preds.append(predicted_ids.cuda())
 
-    transcription = processor.decode(torch.cat(all_preds))
-    transcription_with_punctuation = punctuation_model.restore_punctuation(transcription)
+    transcript = processor.decode(torch.cat(all_preds))
+    # The whole text is too long, but half should be fine.
+    split_transcription = transcript.split()
+    halfway = int(len(split_transcription)/2)
+    transcription = []
+    for transcript_chunk in [" ".join(split_transcription[:halfway]), " ".join(split_transcription[halfway:])]:
+        transcription.append(punctuation_model.restore_punctuation(transcript_chunk))
+    transcription_with_punctuation = " ".join(transcription)
 
     target_path, _ = os.path.splitext(input_mp3)
     with open(f'{target_path}-transcription.txt', 'w') as f:
